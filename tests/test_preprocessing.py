@@ -24,8 +24,16 @@ class TestTransformText:
         assert result == ""
 
     def test_special_characters_only(self):
-        result = transform_text("!@#$%^&*()")
+        result = transform_text("@#$%^&*()")
         assert result == ""
+
+    def test_exclamation_kept_as_signal(self):
+        assert transform_text("!!") == "exclamtoken exclamtoken"
+
+    def test_spam_signals_become_tokens(self):
+        tokens = transform_text("Win $500 now at http://bit.ly/x or mail win@prize.com, 50% off").split()
+        for tok in ("moneytoken", "urltoken", "emailtoken", "percenttoken"):
+            assert tok in tokens
 
     def test_stopwords_removed(self):
         result = transform_text("I am going to the store")

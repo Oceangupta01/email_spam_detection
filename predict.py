@@ -1,129 +1,71 @@
 """
 Prediction module for the Email/SMS Spam Detection system.
 
-The model and vectoriser are loaded **once** when this module is first
-imported.  Subsequent calls to ``predict()`` reuse them.
-
-v2: Returns extended result dict with heuristic signals, threat labels,
-and individual probability breakdown for frontend explainability.
+Artifacts are loaded once. If they are missing or were produced by a
+different scikit-learn / model version, the model is retrained
+automatically so a deployment never runs an incompatible pickle.
 """
 
+import json
 import logging
 import os
 import pickle
+from functools import lru_cache
 
 import numpy as np
+import sklearn
 
-from data_preprocessing import transform_text
-from heuristics import compute_heuristic_score, fuse_scores
+import train
+from data_preprocessing import extract_email_text, transform_text
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
-
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "model.pkl")
-VECTORIZER_PATH = os.path.join(BASE_DIR, "vectorizer.pkl")
-
-# ---------------------------------------------------------------------------
-# Load model and vectoriser once
-# ---------------------------------------------------------------------------
-
-def _load_pickle(path: str):
-    if not os.path.exists(path):
-        raise FileNotFoundError(
-            f"Required file not found: {path}. "
-            "Please run 'python train.py' first."
-        )
-    with open(path, "rb") as f:
-        return pickle.load(f)
+MAX_INPUT_LENGTH = 10_000
+DEFAULT_THRESHOLD = 0.5
 
 
-_model = _load_pickle(MODEL_PATH)
-_vectorizer = _load_pickle(VECTORIZER_PATH)
-
-logger.info("Model and vectorizer loaded successfully.")
-
-# ---------------------------------------------------------------------------
-# Label mapping
-# ---------------------------------------------------------------------------
-
-_LABEL_MAP = {0: "ham", 1: "spam"}
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-MAX_INPUT_LENGTH = 10_000  # characters
+def _artifacts_current() -> bool:
+    if not all(os.path.exists(p) for p in (train.MODEL_PATH, train.VECTORIZER_PATH, train.METRICS_PATH)):
+        return False
+    with open(train.METRICS_PATH) as f:
+        meta = json.load(f)
+    return meta.get("model_version") == train.MODEL_VERSION and meta.get("sklearn_version") == sklearn.__version__
 
 
-def predict(text: str) -> dict:
-    """Classify a single text as *spam* or *ham* using a hybrid ML + heuristic engine.
-
-    Parameters
-    ----------
-    text : str
-        Raw email / SMS body.
-
-    Returns
-    -------
-    dict
-        {
-            "label"            : "spam" | "ham",
-            "confidence"       : float,          # final combined confidence
-            "ml_spam_prob"     : float,          # raw ML spam probability
-            "heuristic_score"  : float,          # rule-based risk score
-            "threat_signals"   : list[str],      # triggered threat labels
-            "spam_prob"        : float,          # final combined spam probability
-        }
-
-    Raises
-    ------
-    ValueError
-        If *text* is empty or exceeds ``MAX_INPUT_LENGTH``.
-    """
-    if not text or not text.strip():
-        raise ValueError("Input text must not be empty.")
-
-    if len(text) > MAX_INPUT_LENGTH:
-        raise ValueError(
-            f"Input text exceeds maximum length of {MAX_INPUT_LENGTH} characters."
-        )
-
-    # 1. Heuristic score (on raw text to preserve structural signals)
-    heuristic_score, threat_signals = compute_heuristic_score(text)
-
-    # 2. Preprocess (enhanced pipeline with placeholder tokens)
-    cleaned = transform_text(text)
-
-    # 3. Vectorise
-    vector = _vectorizer.transform([cleaned])
-
-    # 4. ML prediction
-    prediction = _model.predict(vector)[0]
-
-    # 5. ML spam probability
-    if hasattr(_model, "predict_proba"):
-        probabilities = _model.predict_proba(vector)[0]
-        # probabilities[1] = spam probability
-        ml_spam_prob = float(probabilities[1])
+@lru_cache(maxsize=1)
+def load_artifacts():
+    """Return (model, vectorizer, metrics, feature_weights)."""
+    if _artifacts_current():
+        with open(train.MODEL_PATH, "rb") as f:
+            model = pickle.load(f)
+        with open(train.VECTORIZER_PATH, "rb") as f:
+            vectorizer = pickle.load(f)
+        with open(train.METRICS_PATH) as f:
+            metrics = json.load(f)
     else:
-        ml_spam_prob = 1.0 if prediction == 1 else 0.0
+        logger.info("Artifacts missing or built with another scikit-learn version – retraining.")
+        model, vectorizer, metrics = train.train_pipeline(save=True)
+    return model, vectorizer, metrics, train.feature_weights(model)
 
-    # 6. Fuse ML + heuristic into final spam probability
-    final_spam_prob = fuse_scores(ml_spam_prob, heuristic_score)
 
-    # 7. Final label & confidence
-    final_label = "spam" if final_spam_prob >= 0.50 else "ham"
-    confidence = final_spam_prob if final_label == "spam" else (1.0 - final_spam_prob)
+def spam_probabilities(texts) -> np.ndarray:
+    """Spam probability for each text (no validation; texts are truncated to MAX_INPUT_LENGTH)."""
+    model, vectorizer, _, _ = load_artifacts()
+    cleaned = [transform_text(extract_email_text(str(t)[:MAX_INPUT_LENGTH])) for t in texts]
+    return model.predict_proba(vectorizer.transform(cleaned))[:, 1]
 
-    return {
-        "label": final_label,
-        "confidence": round(confidence, 4),
-        "ml_spam_prob": round(ml_spam_prob, 4),
-        "heuristic_score": round(heuristic_score, 4),
-        "threat_signals": threat_signals,
-        "spam_prob": round(final_spam_prob, 4),
-    }
+
+def predict(text: str, threshold: float = DEFAULT_THRESHOLD) -> dict:
+    """Classify a single text as *spam* or *ham*.
+
+    Returns ``{"label": "spam" | "ham", "confidence": float, "spam_probability": float}``.
+    Raises ``ValueError`` if *text* is empty or longer than ``MAX_INPUT_LENGTH``.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("Input text must not be empty.")
+    if len(text) > MAX_INPUT_LENGTH:
+        raise ValueError(f"Input text exceeds maximum length of {MAX_INPUT_LENGTH} characters.")
+
+    prob = float(spam_probabilities([text])[0])
+    label = "spam" if prob >= threshold else "ham"
+    return {"label": label, "confidence": prob if label == "spam" else 1 - prob, "spam_probability": prob}

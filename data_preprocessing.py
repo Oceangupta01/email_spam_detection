@@ -1,138 +1,117 @@
 """
 Shared text preprocessing for the Email/SMS Spam Detection system.
 
-This module is used by both training and prediction to ensure
-consistent text transformation.
-
-v2: Enhanced with synthetic placeholder tokens to preserve high-signal
-spam indicators (URLs, money amounts, email addresses, excessive caps)
-that were previously stripped out by the alphanumeric filter, causing
-many real-world email spam messages to be misclassified as ham.
+Used by both training and prediction so the transformation is identical.
+Spam signals (links, money, percentages, phone numbers, "!", ALL-CAPS)
+are converted to placeholder tokens instead of being thrown away.
 """
 
+import email
+import html
 import re
-import string
-import logging
+from email import policy
 
-import nltk
-from nltk.corpus import stopwords
 from nltk.stem.porter import PorterStemmer
 
-logger = logging.getLogger(__name__)
+# NLTK's English stop-word list, embedded so no corpus download is needed at runtime.
+STOP_WORDS = frozenset("""
+a about above after again against ain all am an and any are aren as at be because been
+before being below between both but by can couldn d did didn do does doesn doing don down
+during each few for from further had hadn has hasn have haven having he her here hers
+herself him himself his how i if in into is isn it its itself just ll m ma me mightn more
+most mustn my myself needn no nor not now o of off on once only or other our ours ourselves
+out over own re s same shan she should shouldn so some such t than that the their theirs
+them themselves then there these they this those through to too under until up ve very was
+wasn we were weren what when where which while who whom why will with won wouldn y you your
+yours yourself yourselves
+""".split())
 
-# ---------------------------------------------------------------------------
-# NLTK bootstrap – download required data once
-# ---------------------------------------------------------------------------
+SIGNAL_TOKENS = {
+    "emailtoken": "email address",
+    "urltoken": "link",
+    "moneytoken": "money amount",
+    "percenttoken": "percentage",
+    "phonetoken": "phone number",
+    "exclamtoken": "!",
+    "capstoken": "ALL-CAPS word",
+}
 
-def ensure_nltk_data() -> None:
-    """Download NLTK resources if they are not already present."""
-    import ssl
-    try:
-        _create_unverified_https_context = ssl._create_unverified_context
-    except AttributeError:
-        pass
-    else:
-        ssl._create_default_https_context = _create_unverified_https_context
-
-    for resource in ("punkt", "punkt_tab", "stopwords"):
-        try:
-            nltk.data.find(f"tokenizers/{resource}" if "punkt" in resource else f"corpora/{resource}")
-        except LookupError:
-            logger.info("Downloading NLTK resource: %s", resource)
-            nltk.download(resource, quiet=True)
-
-ensure_nltk_data()
-
-# Instantiate stemmer once at module level
-_stemmer = PorterStemmer()
-_stop_words = set(stopwords.words("english"))
-_punctuation = set(string.punctuation)
-
-# ---------------------------------------------------------------------------
-# Regex patterns for placeholder injection (run BEFORE lowercasing)
-# ---------------------------------------------------------------------------
-_RE_URL = re.compile(
-    r'https?://\S+|www\.\S+|(?:[a-zA-Z0-9-]+\.)+(?:com|net|org|info|biz|io|co|xyz|club|site|click|tk|ml|ga|cf|win|loan|top|pw|ru|cn)\b',
-    re.IGNORECASE,
+EMAIL = re.compile(r"\b[\w.+-]+@[\w-]+\.[\w.]+\b")
+URL = re.compile(
+    r"(https?://\S+|www\.\S+|\b[\w-]+\.(?:com|net|org|info|biz|ru|ly|co|io|xyz|top)\b\S*)",
+    re.I,
 )
-_RE_EMAIL_ADDR = re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b')
-_RE_MONEY = re.compile(r'(?:[\$£€¥₹]\s*\d[\d,\.]*|\d[\d,\.]*\s*(?:USD|GBP|EUR|dollars?|pounds?|euros?|BTC|ETH|USDT))', re.IGNORECASE)
-_RE_PHONE = re.compile(r'\b(?:\+?1[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b|\b09\d{8,10}\b|\b08\d{8,10}\b')
-_RE_EXCLAIM = re.compile(r'!{2,}')   # multiple exclamation marks
-_RE_CAPS_WORD = re.compile(r'\b[A-Z]{3,}\b')  # all-caps words ≥3 letters
+MONEY = re.compile(
+    r"[$£€]\s?\d[\d,]*(?:\.\d+)?|\b\d[\d,]*(?:\.\d+)?\s?(?:usd|dollars|pounds|gbp|eur|euros)\b",
+    re.I,
+)
+PERCENT = re.compile(r"\b\d+(?:\.\d+)?\s?%")
+PHONE = re.compile(r"\+?\d[\d\s-]{8,}\d")
+CAPS = re.compile(r"\b[A-Z]{3,}\b")
+_WORD = re.compile(r"[a-z0-9]+")
+
+_stemmer = PorterStemmer()
+_MAX_REPEAT = 3
 
 
-def _inject_placeholders(text: str) -> str:
-    """Replace high-signal spans with synthetic placeholder tokens before cleaning.
-
-    This preserves critical spam signals that the alphanumeric tokeniser
-    would otherwise silently discard.
-    """
-    # Count uppercase words before any substitution
-    caps_words = _RE_CAPS_WORD.findall(text)
-    caps_count = len(caps_words)
-
-    text = _RE_URL.sub(' __url__ ', text)
-    text = _RE_EMAIL_ADDR.sub(' __emailaddr__ ', text)
-    text = _RE_MONEY.sub(' __money__ ', text)
-    text = _RE_PHONE.sub(' __phone__ ', text)
-    text = _RE_EXCLAIM.sub(' __exclaim__ ', text)
-
-    if caps_count >= 2:
-        # Append urgency tokens proportional to caps usage (capped at 3)
-        text += (' __urgentcaps__' * min(caps_count, 3))
-
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def transform_text(text: str) -> str:
-    """Clean and normalise a single text string.
-
-    Steps
-    -----
-    1. Inject semantic placeholder tokens (URLs, money, emails, caps)
-    2. Lower-case
-    3. Tokenise (NLTK word_tokenize)
-    4. Keep alphanumeric tokens (placeholders already alphanumeric)
-    5. Remove English stop-words
-    6. Apply Porter stemming
-
-    Parameters
-    ----------
-    text : str
-        Raw email / SMS body text.
-
-    Returns
-    -------
-    str
-        Space-joined cleaned tokens including placeholder signals.
-    """
+def transform_text(text) -> str:
+    """Normalise a raw email/SMS into space-joined stemmed tokens plus signal tokens."""
     if not isinstance(text, str):
         text = str(text)
 
-    # Step 1: inject before case-folding so caps detection works
-    text = _inject_placeholders(text)
+    caps = min(len(CAPS.findall(text)), _MAX_REPEAT)
+    exclam = min(text.count("!"), _MAX_REPEAT)
 
-    # Step 2: lowercase
-    text = text.lower()
+    text = EMAIL.sub(" emailtoken ", text)
+    text = URL.sub(" urltoken ", text)
+    text = MONEY.sub(" moneytoken ", text)
+    text = PERCENT.sub(" percenttoken ", text)
+    text = PHONE.sub(" phonetoken ", text)
 
-    # Step 3: tokenise
-    tokens = nltk.word_tokenize(text)
-
-    # Step 4: keep alphanumeric tokens (placeholders like __url__ are alnum-with-underscore)
-    tokens = [t for t in tokens if t.isalnum() or t.startswith('__')]
-
-    # Step 5: remove stop-words (but never remove our placeholders)
     tokens = [
-        t for t in tokens
-        if t.startswith('__') or (t not in _stop_words and t not in _punctuation)
+        t if t in SIGNAL_TOKENS else _stemmer.stem(t)
+        for t in _WORD.findall(text.lower())
+        if t not in STOP_WORDS
     ]
-
-    # Step 6: stem (placeholders are skipped by the stemmer gracefully)
-    tokens = [t if t.startswith('__') else _stemmer.stem(t) for t in tokens]
-
+    tokens += ["exclamtoken"] * exclam + ["capstoken"] * caps
     return " ".join(tokens)
+
+
+_HEADER_LINE = re.compile(r"^[A-Za-z][A-Za-z0-9-]{1,40}:\s?.*$")
+_HTML_TAG = re.compile(r"<[a-zA-Z!/][^>]*>")
+_SCRIPT_STYLE = re.compile(r"<(script|style)\b.*?</\1>", re.S | re.I)
+_HREF = re.compile(r"""href\s*=\s*["']?([^"'\s>]+)""", re.I)
+
+
+def _looks_like_raw_email(text: str) -> bool:
+    lines = [ln for ln in text.lstrip().splitlines()[:15] if ln.strip()]
+    return bool(lines) and _HEADER_LINE.match(lines[0]) is not None and sum(
+        bool(_HEADER_LINE.match(ln)) for ln in lines
+    ) >= 2
+
+
+def strip_html(text: str) -> str:
+    links = " ".join(_HREF.findall(text))
+    text = _HTML_TAG.sub(" ", _SCRIPT_STYLE.sub(" ", text))
+    return f"{html.unescape(text)} {links}"
+
+
+def extract_email_text(text: str) -> str:
+    """Return sender + subject + body for raw RFC-822 emails / HTML; other text is returned unchanged."""
+    if _looks_like_raw_email(text):
+        msg = email.message_from_string(text, policy=policy.default)
+        part = msg.get_body(preferencelist=("plain", "html"))
+        if part is not None:
+            try:
+                body = part.get_content()
+            except (LookupError, ValueError):
+                body = str(part.get_payload())
+            text = f"{msg.get('From', '') or ''}\n{msg.get('Subject', '') or ''}\n{body}"
+    if _HTML_TAG.search(text):
+        text = strip_html(text)
+    return text
+
+
+def pretty_term(term: str) -> str:
+    """Human-readable form of a vocabulary term, e.g. 'urltoken now' -> '[link] now'."""
+    return " ".join(f"[{SIGNAL_TOKENS[w]}]" if w in SIGNAL_TOKENS else w for w in term.split())

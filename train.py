@@ -4,186 +4,273 @@ Training pipeline for the Email/SMS Spam Detection system.
 Usage:
     python train.py
 
-This script:
-1. Loads and cleans the SMS Spam Collection dataset (spam.csv).
-2. Augments it with modern email spam examples (phishing, 419, crypto, etc.)
-3. Applies the enhanced text preprocessing (URL/money/caps placeholders).
-4. Vectorises with TF-IDF using bigrams and sublinear TF scaling.
-5. Compares Multinomial Naive Bayes, Logistic Regression and
-   Linear SVM (calibrated), all with class_weight='balanced'.
-6. Selects the best model by F1 score.
-7. Saves the best model + vectoriser as pickle files.
+1. Loads the SMS Spam Collection (data/spam.csv) and the SpamAssassin email
+   corpus (data/emails.csv.gz) and removes duplicates.
+2. Applies the shared preprocessing (data_preprocessing.transform_text).
+3. Splits 80/20, stratified by source and label, and fits TF-IDF
+   (words + word pairs) on the training split only.
+4. Trains a class-balanced, probability-calibrated Linear SVM.
+5. Benchmarks the original SMS-only pipeline and four alternative models.
+6. Saves model.pkl, vectorizer.pkl and metrics.json (dashboard data).
 """
 
+import json
 import logging
 import os
 import pickle
-import sys
+import time
+from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, f1_score, precision_score, recall_score
-from sklearn.model_selection import train_test_split
-from sklearn.naive_bayes import ComplementNB
-from sklearn.svm import LinearSVC
-from sklearn.preprocessing import LabelEncoder
-
-from data_preprocessing import transform_text
-from email_spam_data import EMAIL_SPAM_AUGMENTATION
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_curve,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+    roc_curve,
 )
+from sklearn.model_selection import train_test_split
+from sklearn.naive_bayes import MultinomialNB
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.svm import LinearSVC
+from sklearn.tree import DecisionTreeClassifier
+
+from data_preprocessing import STOP_WORDS, pretty_term, transform_text
+
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+MODEL_VERSION = 3
+RANDOM_STATE = 42
+MAX_CHARS = 10_000
+SOURCES = ("SMS", "Email")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATA_PATH = os.path.join(BASE_DIR, "spam.csv")
+SMS_PATH = os.path.join(BASE_DIR, "data", "spam.csv")
+EMAIL_PATH = os.path.join(BASE_DIR, "data", "emails.csv.gz")
 MODEL_PATH = os.path.join(BASE_DIR, "model.pkl")
 VECTORIZER_PATH = os.path.join(BASE_DIR, "vectorizer.pkl")
+METRICS_PATH = os.path.join(BASE_DIR, "metrics.json")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Data
 # ---------------------------------------------------------------------------
 
-def load_and_clean_data(path: str) -> pd.DataFrame:
-    """Load spam.csv or compatible CSV and return a cleaned DataFrame."""
-    logger.info("Loading data from %s", path)
-    df = pd.read_csv(path, encoding="latin-1")
+def load_datasets() -> pd.DataFrame:
+    """Return de-duplicated messages with columns text, label (1 = spam), source."""
+    sms = pd.read_csv(SMS_PATH, encoding="latin-1")
+    # Messages containing commas spill into the unnamed overflow columns.
+    sms_text = sms.iloc[:, 1:].fillna("").astype(str).agg(lambda r: ",".join(x for x in r if x), axis=1)
+    sms_df = pd.DataFrame({"text": sms_text, "label": (sms.iloc[:, 0] == "spam").astype(int), "source": "SMS"})
 
-    if "v1" in df.columns and "v2" in df.columns:
-        df = df[["v1", "v2"]]
-        df.columns = ["target", "text"]
-    elif "target" not in df.columns or "text" not in df.columns:
-        raise ValueError("CSV must contain either (v1, v2) or (target, text) columns.")
+    emails = pd.read_csv(EMAIL_PATH).dropna(subset=["text"])
+    email_df = pd.DataFrame({"text": emails["text"].astype(str), "label": emails["target"].astype(int), "source": "Email"})
 
-    # Encode target: ham=0, spam=1
-    encoder = LabelEncoder()
-    df["target"] = encoder.fit_transform(df["target"])
-
-    before = len(df)
-    df = df.drop_duplicates(keep="first").reset_index(drop=True)
-    logger.info("Dropped %d duplicates (%d → %d rows)", before - len(df), before, len(df))
-
-    return df
+    df = pd.concat([sms_df, email_df], ignore_index=True)
+    df["text"] = df["text"].str.slice(0, MAX_CHARS)
+    df = df[df["text"].str.strip() != ""]
+    return df.drop_duplicates(subset="text").reset_index(drop=True)
 
 
-def augment_with_email_spam(df: pd.DataFrame) -> pd.DataFrame:
-    """Merge base SMS dataset with curated email spam augmentation data."""
-    aug_rows = []
-    for label, text in EMAIL_SPAM_AUGMENTATION:
-        aug_rows.append({"target": 1 if label == "spam" else 0, "text": text})
-    aug_df = pd.DataFrame(aug_rows)
-    combined = pd.concat([df, aug_df], ignore_index=True)
-    logger.info(
-        "After augmentation: %d total rows (%d spam, %d ham)",
-        len(combined),
-        (combined["target"] == 1).sum(),
-        (combined["target"] == 0).sum(),
+def split(df: pd.DataFrame):
+    strata = df["source"] + "_" + df["label"].astype(str)
+    return train_test_split(df, test_size=0.2, random_state=RANDOM_STATE, stratify=strata)
+
+
+def build_vectorizer() -> TfidfVectorizer:
+    return TfidfVectorizer(ngram_range=(1, 2), min_df=2, max_features=50_000, sublinear_tf=True)
+
+
+def build_classifier() -> CalibratedClassifierCV:
+    return CalibratedClassifierCV(
+        LinearSVC(max_iter=5000, class_weight="balanced", random_state=RANDOM_STATE), cv=5,
     )
-    return combined
 
 
-def preprocess_column(df: pd.DataFrame) -> pd.DataFrame:
-    """Apply shared text preprocessing to the *text* column."""
-    logger.info("Preprocessing text column …")
-    df = df.copy()
-    df["transformed_text"] = df["text"].apply(transform_text)
-    return df
+def feature_weights(model) -> np.ndarray:
+    """Per-feature spam weight of the calibrated SVM (positive pushes towards spam)."""
+    return np.mean([c.estimator.coef_.ravel() for c in model.calibrated_classifiers_], axis=0)
 
 
-def build_tfidf(texts, max_features: int = 6000):
-    """Fit a TF-IDF vectoriser with bigrams and sublinear scaling, return (vectoriser, matrix)."""
-    vectorizer = TfidfVectorizer(
-        max_features=max_features,
-        ngram_range=(1, 2),         # unigrams + bigrams for phrase-level spam signals
-        sublinear_tf=True,          # log(1 + tf) dampens effect of repeated terms
-        min_df=2,                   # ignore terms appearing in only 1 document
-    )
-    X = vectorizer.fit_transform(texts)
-    return vectorizer, X
+# ---------------------------------------------------------------------------
+# Metrics helpers
+# ---------------------------------------------------------------------------
+
+def _scores(y_true, y_pred, y_prob=None) -> dict:
+    out = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1": f1_score(y_true, y_pred, zero_division=0),
+        "confusion_matrix": confusion_matrix(y_true, y_pred, labels=[0, 1]).tolist(),
+        "support": {"ham": int((y_true == 0).sum()), "spam": int((y_true == 1).sum())},
+    }
+    if y_prob is not None:
+        out["roc_auc"] = roc_auc_score(y_true, y_prob)
+        out["average_precision"] = average_precision_score(y_true, y_prob)
+    return out
+
+
+def _by_source(test_df, pred, prob) -> dict:
+    y = test_df["label"].to_numpy()
+    out = {}
+    for s in SOURCES:
+        m = (test_df["source"] == s).to_numpy()
+        out[s] = _scores(y[m], pred[m], prob[m])
+    return out
+
+
+def _downsample(arrs, n=200):
+    idx = np.unique(np.linspace(0, len(arrs[0]) - 1, min(n, len(arrs[0]))).astype(int))
+    return [np.round(a[idx], 4).tolist() for a in arrs]
+
+
+def _baseline(train_df, test_df) -> dict:
+    """Reproduce the original pipeline: SMS-only training, signals discarded, 3,000-term vocabulary."""
+    def prep(text):
+        return " ".join(t for t in transform_text(text).split() if not t.endswith("token"))
+
+    sms_train = train_df[train_df["source"] == "SMS"]
+    vec = TfidfVectorizer(max_features=3000)
+    X = vec.fit_transform(sms_train["text"].map(prep))
+    clf = CalibratedClassifierCV(LinearSVC(max_iter=2000, random_state=RANDOM_STATE)).fit(X, sms_train["label"])
+    prob = clf.predict_proba(vec.transform(test_df["text"].map(prep)))[:, 1]
+    pred = (prob >= 0.5).astype(int)
+    return {"overall": _scores(test_df["label"].to_numpy(), pred, prob), "by_source": _by_source(test_df, pred, prob)}
+
+
+def _compare_models(X_train, y_train, X_test, y_test) -> list:
+    models = {
+        "Linear SVM (calibrated)": build_classifier(),
+        "Logistic Regression": LogisticRegression(max_iter=3000, class_weight="balanced", C=10),
+        "Multinomial Naive Bayes": MultinomialNB(alpha=0.1),
+        "Decision Tree": DecisionTreeClassifier(random_state=RANDOM_STATE, class_weight="balanced"),
+        "K-Nearest Neighbours": KNeighborsClassifier(n_neighbors=5, metric="cosine"),
+    }
+    rows = []
+    for name, model in models.items():
+        t0 = time.perf_counter()
+        model.fit(X_train, y_train)
+        fit_s = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        prob = model.predict_proba(X_test)[:, 1]
+        pred_s = time.perf_counter() - t0
+        s = _scores(y_test, (prob >= 0.5).astype(int), prob)
+        rows.append({"model": name, "train_seconds": fit_s, "predict_ms_per_msg": 1000 * pred_s / X_test.shape[0], **s})
+        logger.info("%-26s F1=%.4f AUC=%.4f", name, s["f1"], s["roc_auc"])
+    return rows
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train_and_evaluate(X_train, X_test, y_train, y_test):
-    """Train three models with balanced class weights, evaluate and return best."""
+def train_pipeline(save: bool = True, benchmark: bool = True):
+    """Train, evaluate and (optionally) persist artifacts. Returns (model, vectorizer, metrics)."""
+    t_start = time.perf_counter()
+    df = load_datasets()
+    train_df, test_df = split(df)
+    logger.info("Loaded %d unique messages (%d train / %d test)", len(df), len(train_df), len(test_df))
 
-    models = {
-        "ComplementNB": ComplementNB(),   # handles class imbalance better than MultinomialNB
-        "LogisticRegression": LogisticRegression(
-            class_weight="balanced", max_iter=1000, C=1.0, random_state=42
-        ),
-        "LinearSVC": CalibratedClassifierCV(
-            LinearSVC(class_weight="balanced", max_iter=2000, C=0.5, random_state=42)
-        ),
+    vectorizer = build_vectorizer()
+    X_train = vectorizer.fit_transform(train_df["text"].map(transform_text))
+    X_test = vectorizer.transform(test_df["text"].map(transform_text))
+    y_train, y_test = train_df["label"].to_numpy(), test_df["label"].to_numpy()
+
+    model = build_classifier().fit(X_train, y_train)
+    prob = model.predict_proba(X_test)[:, 1]
+    pred = (prob >= 0.5).astype(int)
+    overall = _scores(y_test, pred, prob)
+    logger.info("Test accuracy %.4f | spam recall %.4f | ROC-AUC %.4f", overall["accuracy"], overall["recall"], overall["roc_auc"])
+
+    fpr, tpr, _ = roc_curve(y_test, prob)
+    prec, rec, _ = precision_recall_curve(y_test, prob)
+    fpr, tpr = _downsample([fpr, tpr])
+    rec, prec = _downsample([rec[::-1], prec[::-1]])
+
+    sweep = []
+    for t in np.round(np.arange(0.05, 0.96, 0.05), 2):
+        p = (prob >= t).astype(int)
+        sweep.append({"threshold": float(t), "precision": precision_score(y_test, p, zero_division=0),
+                      "recall": recall_score(y_test, p, zero_division=0), "f1": f1_score(y_test, p, zero_division=0)})
+
+    coef = feature_weights(model)
+    names = vectorizer.get_feature_names_out()
+    order = np.argsort(coef)
+    top_spam = [{"term": pretty_term(names[i]), "weight": float(coef[i])} for i in order[::-1][:30]]
+    top_ham = [{"term": pretty_term(names[i]), "weight": float(coef[i])} for i in order[:30]]
+
+    errors = test_df.assign(prob=prob, pred=pred)
+    errors = errors[errors["pred"] != errors["label"]]
+    error_rows = [
+        {"text": r.text[:400], "source": r.source, "actual": "Spam" if r.label else "Ham",
+         "spam_probability": round(float(r.prob), 4)}
+        for r in errors.sort_values("prob", key=lambda s: (s - 0.5).abs(), ascending=False).head(25).itertuples()
+    ]
+
+    metrics = {
+        "model_version": MODEL_VERSION,
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "sklearn_version": sklearn.__version__,
+        "vocabulary_size": len(names),
+        "stop_words": len(STOP_WORDS),
+        "data": {
+            "total": len(df), "train": len(train_df), "test": len(test_df),
+            "by_source": {s: {"ham": int(((df["source"] == s) & (df["label"] == 0)).sum()),
+                              "spam": int(((df["source"] == s) & (df["label"] == 1)).sum())} for s in SOURCES},
+        },
+        "test": overall,
+        "test_by_source": _by_source(test_df, pred, prob),
+        "roc_curve": {"fpr": fpr, "tpr": tpr},
+        "pr_curve": {"recall": rec, "precision": prec},
+        "threshold_sweep": sweep,
+        "test_probabilities": {"prob": np.round(prob, 4).tolist(), "label": y_test.tolist()},
+        "top_spam_terms": top_spam,
+        "top_ham_terms": top_ham,
+        "misclassified": error_rows,
     }
+    if benchmark:
+        logger.info("Benchmarking the original pipeline and alternative models …")
+        metrics["baseline"] = _baseline(train_df, test_df)
+        metrics["model_comparison"] = _compare_models(X_train, y_train, X_test, y_test)
+    metrics["training_seconds"] = round(time.perf_counter() - t_start, 1)
 
-    results = []
-
-    for name, model in models.items():
-        logger.info("Training %s …", name)
-        model.fit(X_train, y_train)
-        y_pred = model.predict(X_test)
-
-        acc  = accuracy_score(y_test, y_pred)
-        prec = precision_score(y_test, y_pred)
-        rec  = recall_score(y_test, y_pred)
-        f1   = f1_score(y_test, y_pred)
-
-        results.append({"name": name, "model": model, "accuracy": acc, "precision": prec, "recall": rec, "f1": f1})
-        logger.info("%s  →  Accuracy=%.4f  Precision=%.4f  Recall=%.4f  F1=%.4f", name, acc, prec, rec, f1)
-        print(f"\n--- {name} ---")
-        print(classification_report(y_test, y_pred, target_names=["ham", "spam"]))
-
-    # Pick best by F1
-    best = max(results, key=lambda r: r["f1"])
-    logger.info("Best model: %s (F1=%.4f)", best["name"], best["f1"])
-    return best["model"], best["name"]
+    if save:
+        save_artifacts(model, vectorizer, metrics)
+    return model, vectorizer, metrics
 
 
-def save_artifacts(model, vectorizer, model_path: str, vectorizer_path: str):
-    """Persist model and vectoriser as pickle files."""
-    with open(model_path, "wb") as f:
-        pickle.dump(model, f)
-    logger.info("Saved model to %s", model_path)
+def save_artifacts(model, vectorizer, metrics):
+    try:
+        with open(MODEL_PATH, "wb") as f:
+            pickle.dump(model, f)
+        with open(VECTORIZER_PATH, "wb") as f:
+            pickle.dump(vectorizer, f)
+        with open(METRICS_PATH, "w") as f:
+            json.dump(metrics, f, indent=1, default=float)
+        logger.info("Saved model.pkl, vectorizer.pkl and metrics.json to %s", BASE_DIR)
+    except OSError:
+        logger.warning("Could not write artifacts (read-only filesystem?); using the in-memory model.")
 
-    with open(vectorizer_path, "wb") as f:
-        pickle.dump(vectorizer, f)
-    logger.info("Saved vectorizer to %s", vectorizer_path)
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
-    df = load_and_clean_data(DATA_PATH)
-    df = augment_with_email_spam(df)
-    df = preprocess_column(df)
-
-    vectorizer, X = build_tfidf(df["transformed_text"])
-    y = df["target"]
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y,
-    )
-
-    best_model, best_name = train_and_evaluate(X_train, X_test, y_train, y_test)
-    save_artifacts(best_model, vectorizer, MODEL_PATH, VECTORIZER_PATH)
-
-    print(f"\n✅  Training complete. Best model: {best_name}")
-    print(f"    Model saved to  : {MODEL_PATH}")
-    print(f"    Vectorizer saved: {VECTORIZER_PATH}")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    _, _, m = train_pipeline()
+    print(f"\nTraining complete in {m['training_seconds']}s")
+    print(f"{'Scope':8s} {'Acc':>7s} {'Prec':>7s} {'Recall':>7s} {'F1':>7s}")
+    for scope, s in [("Overall", m["test"]), *m["test_by_source"].items()]:
+        print(f"{scope:8s} {s['accuracy']:7.4f} {s['precision']:7.4f} {s['recall']:7.4f} {s['f1']:7.4f}")
+    b = m["baseline"]["by_source"]["Email"]
+    print(f"\nOriginal pipeline on email: recall {b['recall']:.4f}, F1 {b['f1']:.4f}")
 
 
 if __name__ == "__main__":
